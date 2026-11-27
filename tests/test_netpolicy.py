@@ -34,8 +34,10 @@ class FakeHost:
     calls: list[tuple[str, ...]] = field(default_factory=list)
     delay: float = 0.0
 
+    ruleset: bytes = b'{"nftables": [{"metainfo": {"json_schema_version": 1}}]}'
+
     async def __call__(self, argv: Sequence[str], *, timeout: float, stdin: bytes | None = None,
-                       check: bool = True) -> CommandResult:
+                       check: bool = True, max_output: int = 1 << 20) -> CommandResult:
         args = tuple(argv)
         self.calls.append(args)
         if self.delay:
@@ -50,6 +52,8 @@ class FakeHost:
 
         if args[:2] == ("ip", "netns") and args[2:3] == ("exec",):
             args = args[4:]
+        if args == ("nft", "-j", "list", "ruleset"):
+            return ok(self.ruleset)
         if args[0] == "nft":
             assert stdin is not None
             self.nft_docs.append(json.loads(stdin))
@@ -162,6 +166,7 @@ async def test_ruleset_logs_every_verdict_with_shared_format() -> None:
 
 
 SETUP_STEPS = [
+    "nft -j list ruleset",  # forward-path check (start)
     "nft -j -f -",  # root table (start)
     "ip -j -4 addr show",
     "ip netns add",
@@ -231,6 +236,36 @@ async def test_start_failure_raises_isolation_error() -> None:
         await p.start()
     await p.close()
     assert not any("destroy" in json.dumps(d) for d in host.nft_docs)  # never removes a table it did not create
+
+
+async def test_start_refuses_when_forward_is_dropped_elsewhere() -> None:
+    host = FakeHost()
+    host.ruleset = json.dumps({"nftables": [
+        {"chain": {"family": "ip", "table": "filter", "name": "FORWARD", "type": "filter",
+                   "hook": "forward", "prio": 0, "policy": "drop"}},
+    ]}).encode()
+    p = make(host)
+    with pytest.raises(IsolationError, match="ip filter FORWARD"):
+        await p.start()
+    # Only the read-only inspection ran: nothing created, nothing to clean up.
+    assert host.calls == [("nft", "-j", "list", "ruleset")]
+    assert host.nft_docs == []
+    with pytest.raises(IsolationError):
+        await p.setup("vm1", 5, NetworkPolicy())
+    assert host.netns == set() and host.links == set()
+    await p.close()
+    assert host.nft_docs == []
+
+
+@pytest.mark.parametrize("bad", [b"not json", b"[]", b'{"nftables": [1]}'])
+async def test_start_refuses_when_ruleset_unreadable(bad: bytes) -> None:
+    host = FakeHost()
+    host.ruleset = bad
+    p = make(host)
+    with pytest.raises(IsolationError, match="inspect"):
+        await p.start()
+    assert host.nft_docs == []
+    await p.close()
 
 
 async def test_teardown_failure_is_reported_but_other_steps_run() -> None:

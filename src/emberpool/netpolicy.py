@@ -76,6 +76,8 @@ __all__ = [
     "log_prefix",
     "parse_log_prefix",
     "HostNetPolicy",
+    "forward_blockers",
+    "forward_block_message",
 ]
 
 log = logging.getLogger(__name__)
@@ -125,6 +127,161 @@ def parse_log_prefix(prefix: str | bytes) -> Verdict | None:
     if prefix == LOG_PREFIX_DROPPED:
         return "dropped"
     return None
+
+
+# --------------------------------------------------------------------------
+# Other firewalls on the forward path
+# --------------------------------------------------------------------------
+
+# Families whose forward hook sees the guests' (IPv4-only) traffic.
+_FORWARD_FAMILIES = ("ip", "inet")
+_MAX_RULESET_BYTES = 16 << 20
+
+
+def _strip_counters(expr: list[Any]) -> list[Any]:
+    return [e for e in expr if not (isinstance(e, dict) and set(e) == {"counter"})]
+
+
+def _covers_uplinks(pattern: object, prefix: str) -> bool:
+    """True if an interface-name match `pattern` matches every `<prefix>-hN`."""
+    if not isinstance(pattern, str):
+        return False
+    if pattern.endswith("*"):
+        return f"{prefix}-h".startswith(pattern[:-1])
+    return False
+
+
+def _ifname_match(e: object, key: str, prefix: str) -> bool:
+    if not isinstance(e, dict) or set(e) != {"match"}:
+        return False
+    m = e["match"]
+    return (
+        isinstance(m, dict)
+        and m.get("op") == "=="
+        and m.get("left") == {"meta": {"key": key}}
+        and _covers_uplinks(m.get("right"), prefix)
+    )
+
+
+def _ct_established(e: object) -> bool:
+    if not isinstance(e, dict) or set(e) != {"match"}:
+        return False
+    m = e["match"]
+    if not isinstance(m, dict) or m.get("left") != {"ct": {"key": "state"}}:
+        return False
+    right = m.get("right")
+    states = {right} if isinstance(right, str) else set(right) if isinstance(right, list) else set()
+    return m.get("op") in ("==", "in") and bool(states) and states <= {"established", "related"}
+
+
+def _uplink_accept(expr: list[Any], prefix: str) -> str | None:
+    """"in" or "out" if the rule is exactly an accept of all traffic from
+    (or, optionally only replies, to) emberpool uplinks; None otherwise."""
+    body = _strip_counters(expr)
+    if not body or body[-1] != {"accept": None}:
+        return None
+    conds = body[:-1]
+    if len(conds) == 1 and _ifname_match(conds[0], "iifname", prefix):
+        return "in"
+    outs = [c for c in conds if _ifname_match(c, "oifname", prefix)]
+    if len(outs) == 1 and all(c is outs[0] or _ct_established(c) for c in conds) and len(conds) <= 2:
+        return "out"
+    return None
+
+
+def _is_unconditional(expr: list[Any]) -> bool:
+    return all(isinstance(e, dict) and not ({"match", "xt"} & set(e)) for e in expr)
+
+
+def _accepts_uplinks(
+    rules: dict[tuple[str, str, str], list[list[Any]]], family: str, table: str, chain: str, prefix: str
+) -> bool:
+    """Conservatively decide whether base chain `chain` accepts traffic from
+    and back to emberpool uplinks before anything else can drop it.
+
+    Recognised: the base chain starts with unconditional jumps to regular
+    chains, and one of those begins with (counted) accept rules for
+    `iifname "<prefix>-h*"` and `oifname "<prefix>-h*"` (optionally limited
+    to established/related) before any other rule. Anything else, including
+    iptables `xt` matches whose content nft cannot show, is not recognised."""
+    for expr in rules.get((family, table, chain), []):
+        body = _strip_counters(expr)
+        if len(body) == 1 and isinstance(body[0], dict) and "jump" in body[0]:
+            target = body[0]["jump"].get("target") if isinstance(body[0]["jump"], dict) else None
+            seen: set[str] = set()
+            for sub in rules.get((family, table, str(target)), []):
+                kind = _uplink_accept(sub, prefix)
+                if kind is None:
+                    break
+                seen.add(kind)
+                if seen == {"in", "out"}:
+                    return True
+            if seen:
+                return False  # partial exemption followed by something else
+            sub_rules = rules.get((family, table, str(target)), [])
+            if sub_rules and not (
+                len(sub_rules) == 1 and _strip_counters(sub_rules[0]) == [{"return": None}]
+            ):
+                return False  # the jumped-to chain may itself drop
+            continue
+        return False
+    return False
+
+
+def forward_blockers(ruleset: object, prefix: str, own_table: str) -> list[str]:
+    """Base chains in other tables that would drop VM traffic our table
+    accepts: a forward-hook chain (ip or inet) whose policy is drop, or whose
+    last rule is an unconditional drop or reject, unless it is recognisably
+    exempting emberpool uplinks. Input is `nft -j list ruleset` output.
+    Raises ValueError if the input is not shaped like that."""
+    if not isinstance(ruleset, dict) or not isinstance(ruleset.get("nftables"), list):
+        raise ValueError("not nft JSON ruleset output")
+    chains: list[dict[str, Any]] = []
+    rules: dict[tuple[str, str, str], list[list[Any]]] = {}
+    for item in ruleset["nftables"]:
+        if not isinstance(item, dict):
+            raise ValueError("unexpected item in nft JSON ruleset")
+        if isinstance(item.get("chain"), dict):
+            chains.append(item["chain"])
+        elif isinstance(item.get("rule"), dict):
+            r = item["rule"]
+            expr = r.get("expr")
+            if not isinstance(expr, list):
+                raise ValueError("nft rule without expressions")
+            rules.setdefault((str(r.get("family")), str(r.get("table")), str(r.get("chain"))), []).append(expr)
+    found: list[str] = []
+    for c in chains:
+        family, table, name = str(c.get("family")), str(c.get("table")), str(c.get("name"))
+        if c.get("hook") != "forward" or family not in _FORWARD_FAMILIES:
+            continue
+        if family == "inet" and table == own_table:
+            continue
+        chain_rules = rules.get((family, table, name), [])
+        last = chain_rules[-1] if chain_rules else []
+        final_drop = bool(last) and _is_unconditional(last) and any(
+            isinstance(e, dict) and ("drop" in e or "reject" in e) for e in last
+        )
+        if c.get("policy") != "drop" and not final_drop:
+            continue
+        if _accepts_uplinks(rules, family, table, name, prefix):
+            continue
+        how = "policy drop" if c.get("policy") == "drop" else "final drop rule"
+        found.append(f"{family} {table} {name} ({how})")
+    return found
+
+
+def forward_block_message(blockers: list[str], prefix: str) -> str:
+    uplinks = f"{prefix}-h+"
+    return (
+        "another firewall would drop forwarded sandbox traffic: "
+        + ", ".join(blockers)
+        + ". emberpool's table cannot override a drop in another table, and it will not"
+        " change rules it does not own. Exempt the emberpool uplinks first. With Docker:"
+        f" iptables -I DOCKER-USER -i {uplinks} -j ACCEPT;"
+        f" iptables -I DOCKER-USER -o {uplinks} -j ACCEPT"
+        " (emberpool's own table still drops new connections into sandboxes)."
+        " Otherwise add equivalent accept rules for those interfaces at the start of each listed chain."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -254,6 +411,8 @@ class HostNetPolicy:
                 raise IsolationError("HostNetPolicy is closed")
             if self._started:
                 return
+            # Read-only check first: nothing is created if it fails.
+            await self._check_forward_path()
             try:
                 await self._ensure_ip_forward()
                 await self._nft(self._root_table_ruleset())
@@ -375,6 +534,20 @@ class HostNetPolicy:
         if netns is not None:
             argv = ["ip", "netns", "exec", validate_netns(netns), *argv]
         await self._run(argv, stdin=doc)
+
+    async def _check_forward_path(self) -> None:
+        """Fail closed if another table would drop forwarded VM traffic."""
+        try:
+            r = await self._runner(
+                ["nft", "-j", "list", "ruleset"], timeout=self._timeout, max_output=_MAX_RULESET_BYTES
+            )
+            if r.stdout_truncated:
+                raise ValueError("ruleset too large to inspect")
+            blockers = forward_blockers(json.loads(r.stdout), self.prefix, self.table)
+        except Exception as e:
+            raise IsolationError(f"could not inspect the host firewall: {e}") from e
+        if blockers:
+            raise IsolationError(forward_block_message(blockers, self.prefix))
 
     async def _ensure_ip_forward(self) -> None:
         r = await self._run(["sysctl", "-n", "net.ipv4.ip_forward"])
