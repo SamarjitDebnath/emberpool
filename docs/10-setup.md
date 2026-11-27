@@ -78,7 +78,7 @@ sudo chroot /tmp/rootfs /bin/sh -c 'passwd -d root'
 cd ~ && sudo umount /tmp/rootfs
 ```
 
-The `resolv.conf` line lets `apk` reach the mirror during the build. `openrc` and the `inittab` line give a login on the serial console, which is useful for manual debugging. The emberpool guest agent will be baked into this image once it exists; at runtime the guest's DNS is pointed at emberpool's resolver.
+The `resolv.conf` line lets `apk` reach the mirror during the build. `openrc` and the `inittab` line give a login on the serial console, which is useful for manual debugging. This plain image is only for the smoke test below; sandboxes need the guest image from step 6.
 
 ## 5. Smoke test
 
@@ -96,7 +96,17 @@ EOF
 
 You should reach a `login:` prompt. Log in as `root`, run `python3 --version`, then `reboot` to exit.
 
-## 6. Python environment
+## 6. Guest image
+
+Sandboxes boot an image that carries the emberpool guest agent. Build it with the script in the repository (it needs root, Docker and `mkfs.ext4`; nothing is mounted on the host):
+
+```
+sudo scripts/build-rootfs.sh ~/fc/emberpool-rootfs.ext4
+```
+
+The image mounts an overlay with its upper layer on the per-VM scratch drive, brings up `eth0` as `172.16.0.2`, points DNS at `172.16.0.1` and keeps the agent listening on vsock port 1024. The script's header describes the boot sequence in full.
+
+## 7. Python environment
 
 From the repository root:
 
@@ -106,6 +116,17 @@ uv run python -c "import emberpool"
 ```
 
 Always run Python through `uv run`.
+
+Tell emberpool where the files are, either with a `Settings` object or with environment variables (see [API](20-api.md)):
+
+```
+export EMBERPOOL_FIRECRACKER=$HOME/fc/firecracker
+export EMBERPOOL_JAILER=$HOME/fc/jailer
+export EMBERPOOL_KERNEL=$HOME/fc/Image
+export EMBERPOOL_ROOTFS=$HOME/fc/emberpool-rootfs.ext4
+```
+
+The process that runs the pool must be root.
 
 ## Networking requirements
 
@@ -120,9 +141,22 @@ The tap MAC must be the same for the template and every clone: the guest's ARP c
 
 Allow/drop rules and logging are not in the namespace. They live in one emberpool nftables table in the host's root namespace, matched on each sandbox's veth, with one allow set per sandbox. See [decisions](30-decisions.md).
 
+emberpool turns on `net.ipv4.ip_forward` for the whole host.
+
+### Hosts with another firewall (for example Docker)
+
+emberpool refuses to start if another firewall table would drop forwarded sandbox traffic after emberpool's own table accepts it. Docker sets the `FORWARD` policy to drop, so on a Docker host add two accept rules for emberpool's uplinks first, where `<prefix>` is the `Settings.prefix` (`ep` by default):
+
+```
+sudo iptables -I DOCKER-USER -i <prefix>-h+ -j ACCEPT
+sudo iptables -I DOCKER-USER -o <prefix>-h+ -j ACCEPT
+```
+
+emberpool's own table still drops every connection that is not on a sandbox's allowlist. These rules are not persistent across reboots unless you save them. emberpool never adds or changes rules it does not own.
+
 ## Disk layout per sandbox
 
-All sandboxes share one read-only `rootfs.ext4`. Each sandbox also gets a small sparse scratch drive that the guest uses as its overlayfs upper layer, so writes never touch the shared image. Both drives must appear at the same paths inside every sandbox's jailer chroot, because the snapshot records them. After teardown the host reads the scratch drive with userspace tools (never by mounting it) to produce the advisory file-change list.
+All sandboxes share one read-only `rootfs.ext4`. Each sandbox also gets a sparse copy of the template's scratch drive, taken after the template was paused, which the guest uses as its overlayfs upper layer, so writes never touch the shared image. A freshly formatted drive would not work: the guest kernel's view of that filesystem is part of the snapshot. Both drives must appear at the same paths inside every sandbox's jailer chroot, because the snapshot records them. After teardown the host reads the scratch drive with userspace tools (never by mounting it) to produce the advisory file-change list.
 
 ## Cleanup
 

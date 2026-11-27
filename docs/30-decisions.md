@@ -97,3 +97,39 @@ Design decisions, newest last. Related: [scope](00-scope.md) · [API](20-api.md)
 **Decision:** v0.1 runs code only. The request frame reserves an optional `files` field so v0.2 can add file transfer without a protocol change.
 **Why:** Protects the v0.1 schedule while keeping the guest protocol stable.
 **Rejected:** File transfer in v0.1.
+
+## Fresh python3 per run
+**Date:** 2026-11-27
+**Decision:** The snapshot holds only the warm guest agent. Each run's code starts in a new `python3` process; there is no pre-imported interpreter or fork server.
+**Why:** Per-process state, such as Python's `random` seed, is never shared between clones of one snapshot, and nothing one run's interpreter does can reach the next.
+**Rejected:** A fork server or a pre-imported interpreter in the snapshot: faster start, but every clone would share the same interpreter state.
+
+## Per-clone copy of the template's scratch drive
+**Date:** 2026-11-27
+**Decision:** Each restored VM gets a sparse byte copy of the template's scratch drive, taken after the template was paused.
+**Why:** The guest kernel's view of the scratch filesystem is part of the snapshot. A freshly formatted drive would not match it. Verified in the dev VM.
+**Rejected:** A new empty scratch drive per clone; sharing one scratch drive.
+
+## Refuse to start on a blocking host firewall
+**Date:** 2026-11-27
+**Decision:** The network policy reads the host ruleset at start and refuses to start if another table would drop forwarded traffic from emberpool's uplinks. It names the chain and the rules an operator can add.
+**Why:** emberpool's table cannot override a drop elsewhere, and failing later would look like a sandbox network fault. emberpool never edits rules it does not own.
+**Rejected:** Adding exemption rules to other tables automatically; starting anyway.
+
+## Host-wide IP forwarding
+**Date:** 2026-11-27
+**Decision:** emberpool turns on `net.ipv4.ip_forward` for the host.
+**Why:** Sandbox traffic is forwarded from each VM's uplink. emberpool's table still drops every new connection that is not allowlisted.
+**Rejected:** Per-interface forwarding settings: more moving parts for no extra control.
+
+## Settings object with environment fallback
+**Date:** 2026-11-27
+**Decision:** Backend paths, jail identity and the name prefix come from a frozen `Settings` object passed to `SandboxPool`. Unset fields fall back to `EMBERPOOL_*` environment variables, then defaults. Missing or invalid values raise before anything is created.
+**Why:** Paths differ per host. Explicit settings suit library callers; environment variables suit deployments and tests.
+**Rejected:** Hard-coded paths; environment variables only; a configuration file.
+
+## No trace file in v0.1
+**Date:** 2026-11-27
+**Decision:** The trace is returned in `Result.trace` only. v0.1 writes no `trace.json`.
+**Why:** The caller decides where evidence is kept. A file would need a location and a retention policy that v0.1 does not have.
+**Rejected:** Writing `trace.json` per run into the pool's work folder.

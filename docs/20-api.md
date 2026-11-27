@@ -4,7 +4,7 @@ The public Python API.
 
 Related: [scope](00-scope.md) · [setup](10-setup.md) · [decisions](30-decisions.md)
 
-> **Planned, not implemented.** This page describes the target v0.1 API. Names and signatures may change before the first release.
+> **Pre-release.** This page describes the v0.1 API as implemented. Names and signatures may still change before the first release.
 
 ## Public surface
 
@@ -15,6 +15,7 @@ Only these names, exported from `emberpool`, are public and stable once released
 | `SandboxPool` | Owns the warm pool of restored VMs |
 | `Sandbox` | One checked-out VM, used for a single run |
 | `Result` | What a run returns: output, exit code and network trace |
+| `Settings` | Where the backend files are and how sandboxes are named |
 
 Everything else, including modules whose names start with `_`, is internal.
 
@@ -32,12 +33,15 @@ async with SandboxPool(size=4, network="allow:pypi.org,files.pythonhosted.org") 
 
 ## `SandboxPool`
 
+`SandboxPool(size, network="deny", settings=None)`
+
 Creating a pool builds the template VM (boot once, snapshot), then restores `size` VMs and keeps them idle.
 
 - `size`: number of idle VMs kept ready. Fixed for the pool's lifetime in v0.1.
 - `network`: egress policy for every sandbox in the pool.
   - `"deny"`: no network. The default.
   - `"allow:<name>,<name>,..."`: only these domain names resolve, and only connections to the addresses they resolved to are allowed.
+- `settings`: where the backend files are; see [`Settings`](#settings). Fields left unset come from environment variables.
 
 `await pool.run(code, timeout=...)` checks out an idle VM, starts a replacement restore in the background, runs `code` in the guest, destroys the VM and returns a `Result`.
 
@@ -63,6 +67,31 @@ File transfer (a `files` argument) is planned for v0.2.
 
 The API is asyncio only; there is no blocking variant in v0.1. The pool is an async context manager. Leaving it destroys every VM and network namespace it created. The process must run as root.
 
+## `Settings`
+
+A frozen object saying where emberpool finds its backend files and how it names what it creates. Every field is optional; a field left as `None` is filled from its environment variable, then from the default. If a required field is still missing, or any value is invalid (a relative path, a missing or non-executable file, a jail id of 0), creating the `SandboxPool` raises `ValueError` before anything is created.
+
+| Field | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `firecracker` | `EMBERPOOL_FIRECRACKER` | required | Firecracker binary (absolute path; its file name contains `firecracker`) |
+| `jailer` | `EMBERPOOL_JAILER` | required | Jailer binary |
+| `kernel` | `EMBERPOOL_KERNEL` | required | Guest kernel image |
+| `rootfs` | `EMBERPOOL_ROOTFS` | required | Guest root filesystem with the emberpool agent |
+| `jail_base` | `EMBERPOOL_JAIL_BASE` | `/srv/jailer` | Folder for jails and the template snapshot |
+| `jail_uid`, `jail_gid` | `EMBERPOOL_JAIL_UID`, `EMBERPOOL_JAIL_GID` | `10123` | Identity the VM process runs as; never 0 |
+| `prefix` | `EMBERPOOL_PREFIX` | `ep` | Start of every namespace, interface, nftables table and cgroup name: `ep`, or `ep-` plus up to 5 lowercase letters or digits |
+
+The host nftables table is named `emberpool` for the default prefix and after the prefix otherwise, so pools with different prefixes can share a host.
+
+```python
+from pathlib import Path
+from emberpool import SandboxPool, Settings
+
+settings = Settings(rootfs=Path("/srv/emberpool/rootfs.ext4"))  # the rest from EMBERPOOL_*
+async with SandboxPool(size=2, settings=settings) as pool:
+    ...
+```
+
 ## `Result`
 
 | Field | Meaning | Trust |
@@ -77,7 +106,7 @@ Treat the host-recorded fields as evidence and the guest-reported fields as a co
 
 ## Trace
 
-The trace is also written as `trace.json`: a `schema_version` and an ordered list of events. There are two event types:
+The trace is returned in `Result.trace`; v0.1 writes no trace file. `Result.trace.to_json()` gives a `schema_version` and an ordered list of events. There are two event types:
 
 | Type | Fields |
 |---|---|
@@ -89,7 +118,7 @@ The schema is versioned; fields are only added within a major version.
 ## Behaviour callers can rely on
 
 - Each `run` gets a fresh VM. Nothing persists between runs.
-- `os.urandom` and `secrets` differ between sandboxes. Python's `random` module does not: every sandbox starts from the same snapshot, so seed it yourself if you need it to differ.
+- `os.urandom`, `secrets` and Python's `random` module differ between sandboxes: the guest kernel reseeds on restore, and each run's code starts in a fresh `python3` process.
 - With the default policy, all DNS lookups fail and all outbound connections are dropped.
 
 ## Guest protocol (internal)

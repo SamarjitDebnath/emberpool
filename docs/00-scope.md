@@ -6,14 +6,14 @@ Related: [setup](10-setup.md) · [API](20-api.md) · [decisions](30-decisions.md
 
 ## Status
 
-Pre-alpha. The architecture below is designed and partly verified by hand; the library itself is not implemented yet. Any number marked `TARGET` is a goal, not a measurement.
+Pre-alpha. The library is implemented for v0.1 and runs end to end on an aarch64 development host: warm pool, jailed Firecracker restores, per-VM network namespaces, the host resolver and nftables policy, and the host-recorded trace. It has not yet been run on bare metal or released. Any number marked `TARGET` is a goal, not a measurement.
 
 ## What it is
 
 A Python library that gives an AI agent a disposable Linux microVM for each piece of code it runs, and a record of what that code tried to do over the network.
 
 - **Isolation by a real VM.** Each sandbox is a Firecracker microVM under KVM with its own guest kernel. Untrusted code never shares the host kernel.
-- **Fast checkout from a warm pool.** A template VM is booted once and snapshotted with Python already imported. Sandboxes are restored from that snapshot and kept idle until needed. `TARGET`: restore under 50 ms on bare metal.
+- **Fast checkout from a warm pool.** A template VM is booted once and snapshotted once the in-guest agent is ready. Sandboxes are restored from that snapshot and kept idle until needed. `TARGET`: restore under 50 ms on bare metal.
 - **One sandbox per run.** A VM is destroyed after a single run, never reused, so nothing from one run reaches the next.
 - **Network audit trail.** Every DNS query and every connection verdict is recorded on the host and returned with the result.
 - **Default-deny egress.** Code has no network unless the caller allowlists domain names.
@@ -30,7 +30,7 @@ A Python library that gives an AI agent a disposable Linux microVM for each piec
 ```
 
 1. **Build once.** At pool startup, boot a template VM from the kernel and root filesystem, wait until the in-guest agent reports ready, then snapshot memory and device state.
-2. **Restore many.** Each sandbox gets a fresh jailer chroot, a fresh scratch drive on top of the shared read-only root filesystem, and a fresh network namespace, then loads the snapshot. Restored VMs wait idle in the pool.
+2. **Restore many.** Each sandbox gets a fresh jailer chroot, its own copy of the template's scratch drive on top of the shared read-only root filesystem, and a fresh network namespace, then loads the snapshot. Restored VMs wait idle in the pool.
 3. **Run.** The caller checks out an idle VM, a replacement restore starts in the background, and code goes to the guest over vsock. Results come back the same way.
 4. **Tear down.** The VM is killed, its network namespace deleted, and the trace returned to the caller.
 
@@ -69,7 +69,7 @@ Everything the sandbox cannot be trusted to report honestly is enforced and obse
 
 ## Known limitations
 
-- **Repeated application state.** Every clone resumes from the same memory image. The guest kernel reseeds its random number generator on restore (VMGenID), so `os.urandom` and `secrets` are safe. Python's `random` module is not: imported before the snapshot, `random.random()` returns the same sequence in every sandbox. Do not use it for anything that must differ between runs.
+- **Shared snapshot state.** Every clone resumes from the same memory image. Only the guest agent is warm in it; each run's code starts in a fresh `python3` process, so per-process state such as Python's `random` seed is not shared between sandboxes. The guest kernel reseeds its random number generator on restore (VMGenID), so `os.urandom` and `secrets` differ too.
 - **VMGenID depends on the guest kernel build.** On aarch64 the reseed needs a kernel whose VMGenID driver supports device tree. The supported kernel is verified; a different kernel may silently lose the reseed. emberpool will refuse to start if the template VM does not have the driver bound.
 - **Filesystem auditing is advisory.** The guest kernel owns the block device. The post-run file list shows end state only and misses files created and then deleted. The host never mounts the guest's disk; it reads it with userspace tools under size and entry limits.
 - **Architecture.** Developed and verified on aarch64 only so far.
