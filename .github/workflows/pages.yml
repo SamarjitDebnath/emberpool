@@ -1,7 +1,7 @@
 name: Deploy site
 
 # Publishes web/ to GitHub Pages on every push to main that touches it.
-# One-time setup: repository Settings > Pages > Source: "GitHub Actions".
+# Requires repository Settings > Pages > Source set to "GitHub Actions" (done).
 on:
   push:
     branches: [main]
