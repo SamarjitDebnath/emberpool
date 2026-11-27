@@ -5,6 +5,11 @@ namespace by an extra veth, so its traffic takes the same path a guest's
 would (DNAT, masquerade, root-namespace policy). A "server" namespace on the
 host side stands in for the internet.
 
+Tests that build networks run with the test process switched into a private
+"<prefix>-host" namespace that plays the host's root namespace, so they do not
+depend on, or disturb, the real host firewall. test_start_refuses_on_this_host
+runs against the real root namespace.
+
 Every resource is named with the test prefix and removed in `finally`.
 """
 
@@ -12,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import zlib
 from collections.abc import AsyncIterator, Sequence
@@ -75,7 +81,29 @@ async def host_forward_open() -> bool:
 
 
 @pytest.fixture
-async def policy(test_prefix: str) -> AsyncIterator[HostNetPolicy]:
+async def host_ns(test_prefix: str) -> AsyncIterator[str]:
+    """Switch this process (main thread) into a fresh namespace playing the host."""
+    ns = f"{test_prefix}-host"
+    await sh("ip", "netns", "add", ns)
+    orig = os.open("/proc/thread-self/ns/net", os.O_RDONLY)
+    try:
+        fd = os.open(f"/run/netns/{ns}", os.O_RDONLY)
+        try:
+            os.setns(fd, os.CLONE_NEWNET)
+        finally:
+            os.close(fd)
+        try:
+            await sh("ip", "link", "set", "lo", "up")
+            yield ns
+        finally:
+            os.setns(orig, os.CLONE_NEWNET)
+    finally:
+        os.close(orig)
+        await sh("ip", "netns", "del", ns)
+
+
+@pytest.fixture
+async def policy(test_prefix: str, host_ns: str) -> AsyncIterator[HostNetPolicy]:
     o = server_octet(test_prefix)
     table = {"ok.example": f"198.18.{o}.2", "other.example": f"198.18.{o}.3"}
 
@@ -92,7 +120,7 @@ async def policy(test_prefix: str) -> AsyncIterator[HostNetPolicy]:
 
 
 @pytest.fixture
-async def server(test_prefix: str) -> AsyncIterator[tuple[str, str]]:
+async def server(test_prefix: str, host_ns: str) -> AsyncIterator[tuple[str, str]]:
     """A namespace with two addresses serving HTTP on 8080."""
     o = server_octet(test_prefix)
     ns, host_if = f"{test_prefix}-srv", f"{test_prefix}-s"
@@ -202,7 +230,7 @@ async def test_setup_and_teardown_leave_nothing(policy: HostNetPolicy, test_pref
     await policy.teardown(h)  # idempotent
 
 
-async def test_setup_fails_closed_and_cleans_up(test_prefix: str) -> None:
+async def test_setup_fails_closed_and_cleans_up(test_prefix: str, host_ns: str) -> None:
     async def failing(argv: Sequence[str], **kw: object) -> CommandResult:
         if "route" in argv:
             raise CommandError(CommandResult(tuple(argv), 2, b"", b"injected"))
@@ -236,7 +264,7 @@ async def test_subnet_in_use_fails_closed(policy: HostNetPolicy, test_prefix: st
         await sh("ip", "link", "del", "dev", dummy)
 
 
-async def test_existing_table_is_not_taken_over(test_prefix: str) -> None:
+async def test_existing_table_is_not_taken_over(test_prefix: str, host_ns: str) -> None:
     await sh("nft", "add", "table", "inet", test_prefix)
     try:
         p = HostNetPolicy(prefix=test_prefix, table=test_prefix)
@@ -280,7 +308,6 @@ async def test_dns_and_egress_per_vm(
 ) -> None:
     ip_ok, ip_other = server
     i = base_index(test_prefix)
-    forward_open = await host_forward_open()
     a = await policy.setup("vma", i, NetworkPolicy.parse("allow:ok.example"))
     b = await policy.setup("vmb", i + 1, NetworkPolicy.parse("allow:other.example"))
     try:
@@ -303,9 +330,8 @@ async def test_dns_and_egress_per_vm(
             allowed_before = await rule_packets(test_prefix, "f-vma", "ep-allow")
             ok_a = await ga.http(ip_ok)
             assert await rule_packets(test_prefix, "f-vma", "ep-allow") > allowed_before
-            if forward_open:
-                assert ok_a
-                assert await gb.http(ip_other)
+            assert ok_a
+            assert await gb.http(ip_other)
             drop_b = await rule_packets(test_prefix, "f-vmb", "ep-drop")
             assert not await gb.http(ip_ok)
             assert not await ga.http(ip_other)
@@ -325,8 +351,6 @@ async def test_dns_and_egress_per_vm(
     finally:
         await policy.teardown(a)
         await policy.teardown(b)
-    if not forward_open:
-        pytest.skip("host FORWARD policy drops forwarded traffic; end-to-end connect not checked")
 
 
 async def test_deny_policy_gets_nothing(
@@ -341,3 +365,57 @@ async def test_deny_policy_gets_nothing(
             assert "elem" not in json.loads(r.stdout)["nftables"][1]["set"]
     finally:
         await policy.teardown(h)
+
+
+async def test_start_refuses_on_this_host(test_prefix: str) -> None:
+    """Real root namespace: if another firewall drops forwarded traffic, start()
+    refuses and creates nothing."""
+    if await host_forward_open():
+        pytest.skip("this host has no FORWARD drop policy to refuse")
+    before = (await sh("nft", "list", "tables")).stdout
+    p = HostNetPolicy(prefix=test_prefix, table=test_prefix)
+    with pytest.raises(IsolationError, match="DOCKER-USER") as exc:
+        await p.start()
+    assert "ip filter FORWARD" in str(exc.value)
+    await p.close()
+    assert not await nft_has("table", "inet", test_prefix)
+    assert (await sh("nft", "list", "tables")).stdout == before
+
+
+async def iptables(*args: str) -> None:
+    await sh("iptables", "-w", "5", *args)
+
+
+async def test_docker_user_exemption_lets_traffic_through(
+    host_ns: str, server: tuple[str, str], test_prefix: str
+) -> None:
+    """Docker's FORWARD layout, rebuilt inside the private host namespace."""
+    await iptables("-P", "FORWARD", "DROP")
+    await iptables("-N", "DOCKER-USER")
+    await iptables("-A", "FORWARD", "-j", "DOCKER-USER")
+    await iptables("-A", "DOCKER-USER", "-j", "RETURN")
+
+    o = server_octet(test_prefix)
+
+    async def lookup(name: str) -> LookupResult:
+        return LookupResult((f"198.18.{o}.2",) if name == "ok.example" else None, 30)
+
+    p = HostNetPolicy(prefix=test_prefix, table=test_prefix, lookup=lookup)
+    with pytest.raises(IsolationError, match=f"-i {test_prefix}-h\\+ -j ACCEPT"):
+        await p.start()
+    await p.close()
+    assert not await nft_has("table", "inet", test_prefix)
+
+    # The fix the error message recommends.
+    await iptables("-I", "DOCKER-USER", "-i", f"{test_prefix}-h+", "-j", "ACCEPT")
+    await iptables("-I", "DOCKER-USER", "-o", f"{test_prefix}-h+", "-j", "ACCEPT")
+    p = HostNetPolicy(prefix=test_prefix, table=test_prefix, lookup=lookup)
+    async with p:
+        h = await p.setup("vmx", base_index(test_prefix), NetworkPolicy.parse("allow:ok.example"))
+        try:
+            async with Guest(f"{test_prefix}-gx", h.netns) as g:
+                assert await g.dig("ok.example") == ("NOERROR", [server[0]])
+                assert await g.http(server[0])
+                assert not await g.http(server[1])  # not resolved: still dropped by our table
+        finally:
+            await p.teardown(h)
