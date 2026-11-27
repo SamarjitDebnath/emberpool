@@ -4,6 +4,7 @@ The public API is exactly what this module exports.
 """
 
 from emberpool._types import Result
+from emberpool._settings import Settings
 from emberpool.pool import Sandbox, SandboxPool
 
-__all__ = ["SandboxPool", "Sandbox", "Result"]
+__all__ = ["SandboxPool", "Sandbox", "Result", "Settings"]

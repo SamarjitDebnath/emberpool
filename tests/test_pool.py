@@ -79,7 +79,7 @@ def assert_clean(eng: FakeEngine, net: FakeNetPolicy) -> None:
 
 
 def test_public_exports():
-    assert sorted(emberpool.__all__) == ["Result", "Sandbox", "SandboxPool"]
+    assert sorted(emberpool.__all__) == ["Result", "Sandbox", "SandboxPool", "Settings"]
     assert emberpool.SandboxPool is SandboxPool
     assert emberpool.Sandbox is Sandbox
     assert emberpool.Result is Result
@@ -98,8 +98,12 @@ def test_bad_network(parts, network):
         make_pool(parts, network=network)
 
 
-def test_missing_engine_is_not_silently_faked():
-    with pytest.raises(NotImplementedError):
+def test_missing_engine_is_not_silently_faked(monkeypatch):
+    # Without backends the pool uses the real ones, and refuses to be created
+    # when their settings are missing.
+    for var in ("FIRECRACKER", "JAILER", "KERNEL", "ROOTFS"):
+        monkeypatch.delenv(f"EMBERPOOL_{var}", raising=False)
+    with pytest.raises(ValueError, match="settings missing"):
         SandboxPool(1)
 
 

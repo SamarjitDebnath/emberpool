@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 import math
 import shutil
@@ -41,6 +42,7 @@ from typing import Any, Literal, Protocol, Self, TypeVar
 
 from emberpool._names import new_vm_id
 from emberpool._protocol import MAX_CODE_BYTES, MAX_TIMEOUT
+from emberpool._settings import Settings
 from emberpool._types import (
     MAX_UPLINKS,
     ConnEvent,
@@ -231,7 +233,10 @@ class SandboxPool:
     """A warm pool of restored microVMs.
 
     `size` idle VMs are kept ready. `network` is "deny" (the default) or
-    "allow:<name>,<name>,...". Use as an async context manager.
+    "allow:<name>,<name>,...". `settings` says where the Firecracker and
+    jailer binaries, guest kernel and root filesystem are; fields left unset
+    come from EMBERPOOL_* environment variables (see Settings). Use as an
+    async context manager.
 
     The keyword arguments starting with an underscore are internal (tests and
     engine wiring) and not part of the public API.
@@ -244,6 +249,7 @@ class SandboxPool:
         self,
         size: int,
         network: str = "deny",
+        settings: Settings | None = None,
         *,
         _engine: Engine | None = None,
         _netpolicy: NetPolicy | None = None,
@@ -257,13 +263,24 @@ class SandboxPool:
             raise ValueError(f"size must be in 1..{MAX_POOL_SIZE}: {size}")
         self._size = size
         self._policy = NetworkPolicy.parse(network)
-        if _engine is None or _netpolicy is None or _exec is None:
-            raise NotImplementedError(
-                "the Firecracker engine is not wired in yet; pass _engine, _netpolicy and _exec"
-            )
-        self._engine: Engine = _engine
-        self._net: NetPolicy = _netpolicy
-        self._exec: ExecClient = _exec
+        given = (_engine, _netpolicy, _exec)
+        # Real backends, started on enter. Settings are checked here, before
+        # anything exists, so a bad path fails without side effects.
+        self._backends: AbstractAsyncContextManager[Any] | None = None
+        self._stack: contextlib.AsyncExitStack | None = None
+        if all(g is None for g in given) and _tracer is None and _workdir is None:
+            from emberpool import _wiring  # the real backends; tests pass fakes instead
+
+            if settings is not None and not isinstance(settings, Settings):
+                raise TypeError("settings must be an emberpool.Settings")
+            self._backends = _wiring.settings_backends((settings or Settings()).resolve())
+        elif any(g is None for g in given):
+            raise TypeError("internal: pass all of _engine, _netpolicy and _exec, or none")
+        elif settings is not None:
+            raise TypeError("internal: settings and explicit backends are exclusive")
+        self._engine: Engine = _engine  # type: ignore[assignment]  # set on enter if None
+        self._net: NetPolicy = _netpolicy  # type: ignore[assignment]
+        self._exec: ExecClient = _exec  # type: ignore[assignment]
         self._tracer: _Tracer | None = _tracer
         self._given_workdir = _workdir
         self._workdir: Path | None = None
@@ -338,6 +355,11 @@ class SandboxPool:
     # ------------------------------------------------------------------
 
     async def _start(self) -> None:
+        if self._backends is not None:
+            self._stack = contextlib.AsyncExitStack()
+            b = await self._stack.enter_async_context(self._backends)
+            self._engine, self._net, self._exec = b.engine, b.netpolicy, b.exec_client
+            self._tracer, self._given_workdir = b.tracer, b.workdir
         if self._tracer is None:
             self._dispatcher = asyncio.create_task(self._dispatch_events())
         if self._given_workdir is not None:
@@ -405,6 +427,12 @@ class SandboxPool:
 
         if self._made_workdir and self._workdir is not None:
             await asyncio.to_thread(shutil.rmtree, self._workdir, True)
+
+        # Real backends last: the trace reader, network table and namespaces,
+        # and the template folder outlive every VM.
+        if self._stack is not None:
+            stack, self._stack = self._stack, None
+            await stack.aclose()
 
     # ------------------------------------------------------------------
     # Checkout and replacement

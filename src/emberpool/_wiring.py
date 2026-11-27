@@ -27,7 +27,7 @@ import asyncio
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,13 +35,22 @@ from typing import Any
 from emberpool import netpolicy as _np
 from emberpool import trace as _tr
 from emberpool._firecracker import FirecrackerConfig, FirecrackerEngine
+from emberpool._jailer import JailerConfig
 from emberpool._resolver import Lookup
+from emberpool._settings import Settings
 from emberpool._types import IsolationError
 from emberpool.exec_client import VsockExecClient
 from emberpool.netpolicy import DEFAULT_TABLE, HostNetPolicy
 from emberpool.trace import NflogReader, TraceWriter
 
-__all__ = ["Backends", "check_log_format", "real_backends"]
+__all__ = [
+    "Backends",
+    "check_log_format",
+    "engine_config",
+    "real_backends",
+    "settings_backends",
+    "table_name",
+]
 
 
 def check_log_format() -> None:
@@ -70,6 +79,40 @@ class Backends:
             "_tracer": self.tracer,
             "_workdir": self.workdir,
         }
+
+
+def engine_config(settings: Settings) -> FirecrackerConfig:
+    """The engine configuration for resolved settings. Raises ValueError."""
+    if settings.firecracker is None or settings.jailer is None or settings.kernel is None:
+        raise ValueError("settings are not resolved")
+    if settings.rootfs is None or settings.jail_base is None or settings.prefix is None:
+        raise ValueError("settings are not resolved")
+    if settings.jail_uid is None or settings.jail_gid is None:
+        raise ValueError("settings are not resolved")
+    return FirecrackerConfig(
+        jailer=JailerConfig(
+            jailer_bin=settings.jailer,
+            firecracker_bin=settings.firecracker,
+            chroot_base=settings.jail_base,
+            uid=settings.jail_uid,
+            gid=settings.jail_gid,
+            parent_cgroup=settings.prefix,
+        ),
+        kernel_path=settings.kernel,
+        rootfs_path=settings.rootfs,
+    )
+
+
+def table_name(prefix: str) -> str:
+    """The host nftables table for a prefix: "emberpool" for the default."""
+    return DEFAULT_TABLE if prefix == "ep" else prefix
+
+
+def settings_backends(settings: Settings) -> AbstractAsyncContextManager[Backends]:
+    """real_backends() for resolved settings."""
+    cfg = engine_config(settings)
+    assert settings.prefix is not None
+    return real_backends(cfg, prefix=settings.prefix, table=table_name(settings.prefix))
 
 
 @asynccontextmanager
