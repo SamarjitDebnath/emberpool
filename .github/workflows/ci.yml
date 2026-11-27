@@ -1,0 +1,35 @@
+name: CI
+
+# Unit tests on every push and pull request. Tests marked `vm` need root and
+# KVM and skip here; run them on a Linux host with `make test-all`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    # aarch64, the only architecture emberpool is verified on.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run pytest -q
+        env:
+          EMBERPOOL_TEST_PREFIX: ep-ci
+      - name: Guest protocol copy is identical
+        run: cmp src/emberpool/_protocol.py src/emberpool/guest/_protocol.py
+      - name: Shell scripts parse
+        run: bash -n scripts/build-rootfs.sh
