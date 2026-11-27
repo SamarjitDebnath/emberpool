@@ -229,8 +229,9 @@ async def _drain(stream: asyncio.StreamReader, tail: _Tail) -> None:
 # --------------------------------------------------------------------------
 
 
-class _ApiError(EmberpoolError):
-    """The Firecracker API returned an error or a malformed response."""
+class _ApiError(IsolationError):
+    """The Firecracker API returned an error or a malformed response. A VM
+    whose VMM cannot be driven as asked is not started (fail closed)."""
 
 
 def _fault_message(body: bytes) -> str:
@@ -847,7 +848,7 @@ class FirecrackerEngine:
             "--clear-groups",
             "--no-new-privs",
             "--",
-            "debugfs", "-c", "-f", "/dev/stdin", str(image),
+            "debugfs", "-c", "-f", "-", str(image),
         ]  # fmt: skip
         res = await run_command(
             argv, timeout=self.config.changes_timeout, stdin=script, check=False,
