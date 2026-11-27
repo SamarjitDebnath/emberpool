@@ -291,6 +291,7 @@ def _config_msg(group: int, seq: int, *attrs: bytes) -> bytes:
 # ==========================================================================
 
 _T = TypeVar("_T")
+_NETNS_JOIN_TIMEOUT = 10.0
 
 
 def _in_netns(netns: str | None, fn: Callable[[], _T]) -> _T:
@@ -317,7 +318,9 @@ def _in_netns(netns: str | None, fn: Callable[[], _T]) -> _T:
 
     t = threading.Thread(target=target, name=f"netns-{netns}", daemon=True)
     t.start()
-    t.join()
+    t.join(_NETNS_JOIN_TIMEOUT)  # rule 13; the thread is discarded either way
+    if t.is_alive():
+        raise IsolationError(f"timed out working in network namespace {netns}")
     if "error" in box:
         raise box["error"]  # type: ignore[misc]
     return box["value"]  # type: ignore[return-value]

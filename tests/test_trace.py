@@ -565,3 +565,11 @@ def test_reader_validates_arguments() -> None:
         r.fileno()
     with pytest.raises(ValueError):
         r.ifindex("eth0; rm")
+
+
+def test_reader_open_fails_closed_for_missing_netns(test_prefix: str) -> None:
+    reader = NflogReader(netns=f"{test_prefix}-missing")
+    with pytest.raises(IsolationError):
+        reader.open()
+    with pytest.raises(RuntimeError):
+        reader.fileno()  # nothing left open
