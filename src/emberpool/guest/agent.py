@@ -37,6 +37,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 
@@ -54,6 +55,8 @@ IO_TIMEOUT = 30.0
 # leftover grandchild may hold open.
 DRAIN_GRACE = 1.0
 KILL_WAIT = 5.0
+# Longest wait for the guest to write its page cache to disk before replying.
+SYNC_TIMEOUT = 5.0
 ACCEPT_BACKOFF = 0.05
 MAX_ACCEPT_ERRORS = 50
 TRUNCATED_MARK = "\n[emberpool: output truncated]\n"
@@ -190,6 +193,24 @@ def run_code(code: str, timeout: float, python: str = PYTHON) -> tuple[str, str,
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def flush_disk(timeout: float = SYNC_TIMEOUT) -> bool:
+    """Write the guest's dirty page cache to the scratch drive, waiting at most
+    `timeout` seconds. The host kills the VM right after the reply, so without
+    this, files written by the run never reach the drive and the host's
+    advisory change list misses them. Returns False if the flush did not
+    finish in time (the reply is sent anyway)."""
+    done = threading.Event()
+
+    def _sync() -> None:
+        try:
+            os.sync()
+        finally:
+            done.set()
+
+    threading.Thread(target=_sync, name="sync", daemon=True).start()
+    return done.wait(timeout)
+
+
 # --------------------------------------------------------------------------
 # Serving
 # --------------------------------------------------------------------------
@@ -214,6 +235,8 @@ def handle_connection(conn: socket.socket, run: RunFn = run_code) -> bool:
         log(f"bad request: {e}")
         return False
     stdout, stderr, exit_code = run(req.code, req.timeout)
+    if not flush_disk():
+        log("disk flush did not finish in time")
     try:
         reply = proto.encode_response(stdout, stderr, exit_code)
     except proto.ProtocolError as e:  # only if `run` broke its own limits

@@ -304,3 +304,38 @@ def test_serve_one_at_a_time_with_real_listener(test_prefix):
         import shutil
 
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_flush_disk_syncs_before_reply(monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent.os, "sync", lambda: calls.append("sync"))
+    assert agent.flush_disk(1.0) is True
+    assert calls == ["sync"]
+
+
+def test_flush_disk_is_bounded(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(agent.os, "sync", lambda: release.wait(10))
+    try:
+        assert agent.flush_disk(0.05) is False  # gives up; the reply still goes out
+    finally:
+        release.set()
+
+
+def test_reply_waits_for_flush(monkeypatch):
+    order = []
+    monkeypatch.setattr(agent, "flush_disk", lambda timeout=agent.SYNC_TIMEOUT: order.append("flush") or True)
+    host, guest = socket.socketpair()
+    with host, guest:
+        host.sendall(proto.encode_request("x", 1))
+
+        def run(code, timeout):
+            order.append("run")
+            return "out", "", 0
+
+        assert agent.handle_connection(guest, run)
+        order.append("reply")
+        assert proto.decode_response(proto.recv_frame(host)).stdout == "out"
+    assert order == ["run", "flush", "reply"]
