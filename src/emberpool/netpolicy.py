@@ -189,6 +189,25 @@ def _uplink_accept(expr: list[Any], prefix: str) -> str | None:
     return None
 
 
+_VERDICT_KEYS = frozenset({"accept", "drop", "reject", "queue", "jump", "goto", "return", "continue"})
+
+
+def _only_accepts(expr: list[Any]) -> bool:
+    """True if the rule can only accept (whatever it matches): it ends in
+    accept and has no other verdict or target. Such a rule can never drop
+    uplink traffic, so it may stand before emberpool's exemption."""
+    body = _strip_counters(expr)
+    if not body or body[-1] != {"accept": None}:
+        return False
+    for e in body[:-1]:
+        if not isinstance(e, dict) or _VERDICT_KEYS & set(e):
+            return False
+        xt = e.get("xt")
+        if xt is not None and not (isinstance(xt, dict) and xt.get("type") == "match"):
+            return False
+    return True
+
+
 def _is_unconditional(expr: list[Any]) -> bool:
     return all(isinstance(e, dict) and not ({"match", "xt"} & set(e)) for e in expr)
 
@@ -202,7 +221,7 @@ def _accepts_uplinks(
     Recognised: the base chain starts with unconditional jumps to regular
     chains, and one of those begins with (counted) accept rules for
     `iifname "<prefix>-h*"` and `oifname "<prefix>-h*"` (optionally limited
-    to established/related) before any other rule. Anything else, including
+    to established/related), with nothing but accept-only rules before them. Anything else, including
     iptables `xt` matches whose content nft cannot show, is not recognised."""
     for expr in rules.get((family, table, chain), []):
         body = _strip_counters(expr)
@@ -212,6 +231,8 @@ def _accepts_uplinks(
             for sub in rules.get((family, table, str(target)), []):
                 kind = _uplink_accept(sub, prefix)
                 if kind is None:
+                    if _only_accepts(sub):
+                        continue  # e.g. another prefix's exemption; cannot drop ours
                     break
                 seen.add(kind)
                 if seen == {"in", "out"}:
@@ -364,7 +385,11 @@ class HostNetPolicy:
         command_timeout: float = 10.0,
         max_events: int = 65536,
     ) -> None:
-        validate_netns(prefix)
+        # The prefix is not a name itself; check the longest names built from it.
+        if not isinstance(prefix, str):
+            raise ValueError(f"prefix must be a str: {prefix!r}")
+        validate_netns(f"{prefix}-0")
+        validate_interface(f"{prefix}-h255")
         if len(prefix) > 8:
             raise ValueError("prefix must be at most 8 chars (interface names cap at 15)")
         if isinstance(nflog_group, bool) or not isinstance(nflog_group, int) or not 0 <= nflog_group <= 65535:

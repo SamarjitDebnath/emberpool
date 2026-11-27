@@ -112,6 +112,7 @@ def test_is_a_netpolicy() -> None:
     [
         {"prefix": "bad"},
         {"prefix": "ep-toolong"},
+        {"prefix": None},
         {"table": "nft table"},
         {"nflog_group": -1},
         {"nflog_group": True},
@@ -122,6 +123,11 @@ def test_constructor_validates(kw: dict[str, object]) -> None:
     args: dict[str, object] = {"prefix": "ep-unit", "table": "ep-unit", **kw}
     with pytest.raises(ValueError):
         HostNetPolicy(**args)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("prefix", ["ep", "ep-a", "ep-unit"])
+def test_constructor_accepts_default_and_test_prefixes(prefix: str) -> None:
+    HostNetPolicy(prefix=prefix, table="emberpool" if prefix == "ep" else prefix)
 
 
 async def test_setup_and_teardown() -> None:

@@ -107,6 +107,19 @@ def test_exemption_after_other_rules_is_a_blocker() -> None:
     assert blockers(docker([other, IN_OK, OUT_OK])) != []
 
 
+def test_other_accept_rules_before_the_exemption_are_fine() -> None:
+    other_in = u(ifmatch("iifname", "ep-int-h*"), C, ACCEPT)
+    other_out = u(ifmatch("oifname", "ep-int-h*"), C, ACCEPT)
+    assert blockers(docker([other_in, other_out, OUT_OK, IN_OK])) == []
+    assert blockers(docker([other_in, IN_OK, other_out, OUT_OK])) == []
+    # An xt match on an accept still only accepts; an xt target does not.
+    assert blockers(docker([u(XT_CONNTRACK, ACCEPT), IN_OK, OUT_OK])) == []
+    xt_target = u({"xt": {"type": "target", "name": "LOG"}})
+    assert blockers(docker([xt_target, IN_OK, OUT_OK])) != []
+    jump_then_accept = u({"jump": {"target": "X"}}, ACCEPT)
+    assert blockers(docker([jump_then_accept, IN_OK, OUT_OK])) != []
+
+
 def test_exemption_must_cover_the_prefix() -> None:
     narrow_in = u(ifmatch("iifname", "ep-h1*"), C, ACCEPT)
     narrow_out = u(ifmatch("oifname", "ep-h1*"), C, ACCEPT)
