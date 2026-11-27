@@ -602,11 +602,28 @@ class FirecrackerEngine:
         if state.scratch_base is None:
             raise EmberpoolError(f"VM has no scratch drive: {vm.vm_id}")
         cfg = self.config
+        # The VM was killed, so recent writes may sit only in the ext4 journal.
+        # debugfs does not replay it, so e2fsck replays it first, in userspace,
+        # on images that are thrown away: the VM's own scratch drive, and a
+        # private copy of the template's (never the sealed original).
         async with asyncio.timeout(cfg.changes_timeout):
             base = self._base_listings.get(state.scratch_base)
             if base is None:
-                base = await self._scan(state.scratch_base)
+                tmp = state.layout.id_dir / "scratch-base-scan.ext4"
+                try:
+                    await run_command(
+                        ["cp", "--sparse=always", "--", str(state.scratch_base), str(tmp)],
+                        timeout=cfg.changes_timeout,
+                    )
+                    os.chown(tmp, cfg.jailer.uid, cfg.jailer.gid)
+                    os.chmod(tmp, 0o600)
+                    await self._replay_journal(tmp)
+                    base = await self._scan(tmp)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(tmp)
                 self._base_listings[state.scratch_base] = base
+            await self._replay_journal(state.layout.scratch)
             current = await self._scan(state.layout.scratch)
         return diff_listings(base, current, cfg.max_changes)
 
@@ -835,21 +852,35 @@ class FirecrackerEngine:
                         frontier.append((entry.ino, path, depth + 1))
         return entries
 
-    async def _debugfs_ls(self, image: Path, inodes: Iterable[int]) -> dict[int, list[LsEntry]]:
+    def _as_jail_user(self) -> list[str]:
+        """Prefix that runs a host tool on guest-written data as the jail uid,
+        with no supplementary groups and no way to regain privileges."""
         cfg = self.config.jailer
-        inos = [int(i) for i in inodes]
-        if any(not 0 < i < 2**32 for i in inos):
-            raise ValueError("inode number out of range")
-        script = "".join(f"ls -l <{i}>\n" for i in inos).encode("ascii")
-        argv = [
+        return [
             "setpriv",
             "--reuid", str(cfg.uid),
             "--regid", str(cfg.gid),
             "--clear-groups",
             "--no-new-privs",
             "--",
-            "debugfs", "-c", "-f", "-", str(image),
         ]  # fmt: skip
+
+    async def _replay_journal(self, image: Path) -> None:
+        """Replay the ext4 journal of a disposable image (userspace e2fsck,
+        journal only). Failure is logged, not raised: the listing is advisory."""
+        res = await run_command(
+            [*self._as_jail_user(), "e2fsck", "-p", "-E", "journal_only", str(image)],
+            timeout=self.config.changes_timeout, check=False, max_output=1 << 16,
+        )  # fmt: skip
+        if res.returncode not in (0, 1):
+            log.warning("journal replay on %s exited %d; change list may be partial", image, res.returncode)
+
+    async def _debugfs_ls(self, image: Path, inodes: Iterable[int]) -> dict[int, list[LsEntry]]:
+        inos = [int(i) for i in inodes]
+        if any(not 0 < i < 2**32 for i in inos):
+            raise ValueError("inode number out of range")
+        script = "".join(f"ls -l <{i}>\n" for i in inos).encode("ascii")
+        argv = [*self._as_jail_user(), "debugfs", "-c", "-f", "-", str(image)]
         res = await run_command(
             argv, timeout=self.config.changes_timeout, stdin=script, check=False,
             max_output=_DEBUGFS_MAX_OUTPUT,

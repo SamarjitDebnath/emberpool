@@ -333,8 +333,13 @@ async def test_list_changes_reads_scratch_without_mounting(
             await engine.list_changes(vm)
         await engine.kill(vm)
         mounts_before = Path("/proc/self/mounts").read_text()
+        base = template.state_path.with_name(SCRATCH_BASE_NAME)
+        base_before = (base.stat().st_mtime_ns, base.read_bytes())
         changes = await engine.list_changes(vm)
         assert Path("/proc/self/mounts").read_text() == mounts_before
+        assert (base.stat().st_mtime_ns, base.read_bytes()) == base_before  # sealed base untouched
+        assert not (env.config.jailer.layout(vm.vm_id).id_dir / "scratch-base-scan.ext4").exists()
+        assert await engine.list_changes(vm) == changes  # cached base, same answer
         assert "/root/ep-new/deep/f.txt" in changes
         assert "/root/ep-new" in changes
         assert "/root/we ird\\x0aname" in changes
