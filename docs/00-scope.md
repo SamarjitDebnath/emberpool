@@ -45,7 +45,7 @@ Everything the sandbox cannot be trusted to report honestly is enforced and obse
 | Egress limited to the allowlist | nftables on the host side of the VM's tap | No |
 | Network trace is complete | nftables logging and DNS resolver, both on the host | No |
 | Wall-clock timeout | Host kills the VM process | No |
-| Filesystem change list | Host diff of the VM's scratch drive after teardown | Partially; advisory only |
+| Filesystem change list | Host reads the VM's scratch drive after teardown, in userspace, never mounted | Partially; advisory only |
 | stdout / stderr accuracy | Agent inside the guest | Yes; convenience only |
 
 ## Networking
@@ -71,7 +71,7 @@ Everything the sandbox cannot be trusted to report honestly is enforced and obse
 
 - **Repeated application state.** Every clone resumes from the same memory image. The guest kernel reseeds its random number generator on restore (VMGenID), so `os.urandom` and `secrets` are safe. Python's `random` module is not: imported before the snapshot, `random.random()` returns the same sequence in every sandbox. Do not use it for anything that must differ between runs.
 - **VMGenID depends on the guest kernel build.** On aarch64 the reseed needs a kernel whose VMGenID driver supports device tree. The supported kernel is verified; a different kernel may silently lose the reseed. emberpool will refuse to start if the template VM does not have the driver bound.
-- **Filesystem auditing is advisory.** The guest kernel owns the block device. The post-run diff shows end state only and misses files created and then deleted.
+- **Filesystem auditing is advisory.** The guest kernel owns the block device. The post-run file list shows end state only and misses files created and then deleted. The host never mounts the guest's disk; it reads it with userspace tools under size and entry limits.
 - **Architecture.** Developed and verified on aarch64 only so far.
 - **Performance numbers.** Development runs in a nested-virtualization VM, where timings are inflated 2 to 3x. Those timings are never published as benchmarks.
 

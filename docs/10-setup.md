@@ -122,7 +122,7 @@ Allow/drop rules and logging are not in the namespace. They live in one emberpoo
 
 ## Disk layout per sandbox
 
-All sandboxes share one read-only `rootfs.ext4`. Each sandbox also gets a small sparse scratch drive that the guest uses as its overlayfs upper layer, so writes never touch the shared image. Both drives must appear at the same paths inside every sandbox's jailer chroot, because the snapshot records them. After teardown the host diffs the scratch drive to produce the advisory file-change list.
+All sandboxes share one read-only `rootfs.ext4`. Each sandbox also gets a small sparse scratch drive that the guest uses as its overlayfs upper layer, so writes never touch the shared image. Both drives must appear at the same paths inside every sandbox's jailer chroot, because the snapshot records them. After teardown the host reads the scratch drive with userspace tools (never by mounting it) to produce the advisory file-change list.
 
 ## Cleanup
 

@@ -59,7 +59,7 @@ Design decisions, newest last. Related: [scope](00-scope.md) · [API](20-api.md)
 ## Shared read-only rootfs plus a per-VM scratch drive
 **Date:** 2026-11-27
 **Decision:** All clones share one read-only root filesystem. Each VM gets a small sparse scratch drive as the guest's overlayfs upper layer, at the same path inside its jailer chroot.
-**Why:** No per-VM rootfs copy, and the host can diff the scratch drive after teardown for the advisory file-change list.
+**Why:** No per-VM rootfs copy, and the host can list the scratch drive's files after teardown for the advisory file-change list. The host reads it with userspace tools only and never mounts it: a guest-written filesystem is hostile input to the host kernel.
 **Rejected:** Full rootfs copy per VM: 512 MB each. tmpfs upper layer: the host cannot see file changes.
 
 ## One host resolver, policy in the root namespace
