@@ -27,7 +27,7 @@ import pytest
 from emberpool._names import CommandError, CommandResult, run_command
 from emberpool._resolver import LookupResult
 from emberpool._types import TAP_MAC, IsolationError, NetworkPolicy
-from emberpool.netpolicy import HostNetPolicy
+from emberpool.netpolicy import HostNetPolicy, forward_blockers
 
 pytestmark = pytest.mark.vm
 
@@ -73,13 +73,6 @@ async def rule_packets(table: str, chain: str, prefix: str) -> int:
     return total
 
 
-async def host_forward_open() -> bool:
-    """False if another firewall on the host (for example Docker's FORWARD DROP
-    policy in iptables) drops forwarded traffic after our table accepts it."""
-    r = await sh("iptables", "-S", "FORWARD", check=False)
-    return r.returncode != 0 or b"-P FORWARD DROP" not in r.stdout
-
-
 @pytest.fixture
 async def host_ns(test_prefix: str) -> AsyncIterator[str]:
     """Switch this process (main thread) into a fresh namespace playing the host."""
@@ -111,8 +104,8 @@ async def policy(test_prefix: str, host_ns: str) -> AsyncIterator[HostNetPolicy]
         return LookupResult((table[name],) if name in table else None, 30)
 
     p = HostNetPolicy(prefix=test_prefix, table=test_prefix, nflog_group=7, lookup=lookup)
-    await p.start()
     try:
+        await p.start()
         yield p
     finally:
         await p.close()
@@ -268,9 +261,11 @@ async def test_existing_table_is_not_taken_over(test_prefix: str, host_ns: str) 
     await sh("nft", "add", "table", "inet", test_prefix)
     try:
         p = HostNetPolicy(prefix=test_prefix, table=test_prefix)
-        with pytest.raises(IsolationError):
-            await p.start()
-        await p.close()
+        try:
+            with pytest.raises(IsolationError):
+                await p.start()
+        finally:
+            await p.close()
         assert await nft_has("table", "inet", test_prefix)  # left alone
     finally:
         await sh("nft", "delete", "table", "inet", test_prefix)
@@ -370,14 +365,19 @@ async def test_deny_policy_gets_nothing(
 async def test_start_refuses_on_this_host(test_prefix: str) -> None:
     """Real root namespace: if another firewall drops forwarded traffic, start()
     refuses and creates nothing."""
-    if await host_forward_open():
-        pytest.skip("this host has no FORWARD drop policy to refuse")
+    ruleset = json.loads((await sh("nft", "-j", "list", "ruleset")).stdout)
+    blockers = forward_blockers(ruleset, test_prefix, test_prefix)
+    if not blockers:
+        pytest.skip(f"no firewall on this host drops forwarded traffic for {test_prefix}-h*; nothing to refuse")
     before = (await sh("nft", "list", "tables")).stdout
     p = HostNetPolicy(prefix=test_prefix, table=test_prefix)
-    with pytest.raises(IsolationError, match="DOCKER-USER") as exc:
-        await p.start()
-    assert "ip filter FORWARD" in str(exc.value)
-    await p.close()
+    try:
+        with pytest.raises(IsolationError, match="DOCKER-USER") as exc:
+            await p.start()
+        for b in blockers:
+            assert b in str(exc.value)
+    finally:
+        await p.close()
     assert not await nft_has("table", "inet", test_prefix)
     assert (await sh("nft", "list", "tables")).stdout == before
 
@@ -401,9 +401,11 @@ async def test_docker_user_exemption_lets_traffic_through(
         return LookupResult((f"198.18.{o}.2",) if name == "ok.example" else None, 30)
 
     p = HostNetPolicy(prefix=test_prefix, table=test_prefix, lookup=lookup)
-    with pytest.raises(IsolationError, match=f"-i {test_prefix}-h\\+ -j ACCEPT"):
-        await p.start()
-    await p.close()
+    try:
+        with pytest.raises(IsolationError, match=f"-i {test_prefix}-h\\+ -j ACCEPT"):
+            await p.start()
+    finally:
+        await p.close()
     assert not await nft_has("table", "inet", test_prefix)
 
     # The fix the error message recommends.
