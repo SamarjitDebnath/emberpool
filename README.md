@@ -10,7 +10,7 @@ from emberpool import SandboxPool
 async with SandboxPool(size=4, network="allow:pypi.org,files.pythonhosted.org") as pool:
     result = await pool.run(
         "import socket; socket.create_connection(('pypi.org', 443)); print('reached pypi')",
-        timeout=30,
+        timeout=60,  # one deadline: waiting for a free VM plus the run itself
     )
     print(result.exit_code, result.stdout)
     for event in result.trace:          # DNS queries and connection verdicts, seen by the host
@@ -24,7 +24,7 @@ async with SandboxPool(size=4, network="allow:pypi.org,files.pythonhosted.org") 
 Agents run code they wrote a moment ago, and sometimes code someone tricked them into writing. emberpool is built around three ideas:
 
 - **A real VM boundary.** Each run gets its own Firecracker microVM under KVM with its own guest kernel, launched through Firecracker's jailer. Untrusted code never shares the host kernel.
-- **Speed from snapshots.** A template VM is booted once with Python already loaded and snapshotted. Sandboxes are restored from it and kept warm, so a run does not pay for a boot. Every VM is destroyed after one run.
+- **Speed from snapshots.** A template VM is booted once, with the in-guest agent running, and snapshotted. Sandboxes are restored from it and kept warm, so a run does not pay for a kernel boot. Each run starts a fresh `python3` process inside its VM, and every VM is destroyed after one run.
 - **Evidence, not self-reporting.** Network policy and the trace live on the host. The sandbox cannot hide a DNS lookup or a connection attempt, because the guest is never asked.
 
 ## How it works
@@ -144,10 +144,10 @@ docs/                scope, setup, API, decisions, engineering rules
 
 ## Known limitations
 
-- Single host, one fixed-size pool per process. No clustering or persistence between runs.
+- Single host, one fixed-size pool per host: a second pool on the same host refuses to start. No clustering or persistence between runs.
 - asyncio only; no blocking API in v0.1.
 - No file transfer into or out of the sandbox yet (planned for v0.2).
-- The file-change list shows end state only and misses files created and then deleted.
+- The file-change list shows end state only and misses files created and then deleted. It relies on the guest flushing its disk before replying, so code in the sandbox can hide changes from it.
 - Verified on aarch64 only.
 
 ## Contributing
