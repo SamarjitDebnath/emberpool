@@ -30,7 +30,7 @@ A Python library that gives an AI agent a disposable Linux microVM for each piec
 ```
 
 1. **Build once.** At pool startup, boot a template VM from the kernel and root filesystem, wait until the in-guest agent reports ready, then snapshot memory and device state.
-2. **Restore many.** Each sandbox gets a fresh jailer chroot, a fresh disk overlay and a fresh network namespace, then loads the snapshot. Restored VMs wait idle in the pool.
+2. **Restore many.** Each sandbox gets a fresh jailer chroot, a fresh scratch drive on top of the shared read-only root filesystem, and a fresh network namespace, then loads the snapshot. Restored VMs wait idle in the pool.
 3. **Run.** The caller checks out an idle VM, a replacement restore starts in the background, and code goes to the guest over vsock. Results come back the same way.
 4. **Tear down.** The VM is killed, its network namespace deleted, and the trace returned to the caller.
 
@@ -45,19 +45,23 @@ Everything the sandbox cannot be trusted to report honestly is enforced and obse
 | Egress limited to the allowlist | nftables on the host side of the VM's tap | No |
 | Network trace is complete | nftables logging and DNS resolver, both on the host | No |
 | Wall-clock timeout | Host kills the VM process | No |
-| Filesystem change list | Disk overlay diff after teardown | Partially; advisory only |
+| Filesystem change list | Host diff of the VM's scratch drive after teardown | Partially; advisory only |
 | stdout / stderr accuracy | Agent inside the guest | Yes; convenience only |
 
 ## Networking
 
 - Each VM runs in its own network namespace with identical inside addressing, so clones of one snapshot never clash. See [decisions](30-decisions.md).
-- The VM's DNS goes to a resolver run by emberpool. It logs every query and only resolves allowlisted names; everything else gets `NXDOMAIN`.
-- nftables allows connections only to IPs the resolver returned for allowlisted names, logs every verdict, and drops the rest. Allowlisting names rather than IPs keeps rules correct when CDNs rotate addresses, and makes the trace read `pypi.org` instead of a bare IP.
+- The VM's DNS goes to one resolver run by emberpool on the host, shared by all sandboxes. It logs every query and only resolves allowlisted names; everything else gets `NXDOMAIN`.
+- nftables on the host allows connections only to IPs the resolver returned for that sandbox's allowlisted names, logs every verdict, and drops the rest. All policy lives in one host table with one allow set per sandbox; each namespace only forwards DNS and masquerades.
+- The default policy is deny. Every allowed destination must be named by the caller. Allowlisting names rather than IPs keeps rules correct when CDNs rotate addresses, and makes the trace read `pypi.org` instead of a bare IP.
 - Code and results travel over vsock, never over the network.
 
 ## Not in scope
 
-- Multi-host scheduling, clustering or persistence between runs. One host, one pool.
+- Multi-host scheduling, clustering or persistence between runs. One host, one fixed-size pool.
+- A blocking (sync) API. v0.1 is asyncio only.
+- File transfer into or out of the sandbox. Planned for v0.2.
+- Running without root. v0.1 must run as root on the host.
 - Long-lived or interactive sandboxes. A sandbox lives for one run.
 - Non-Linux hosts. Firecracker needs Linux with KVM. On a Mac, run inside a Linux VM with nested virtualization, for development only.
 - GPU access.
@@ -73,7 +77,6 @@ Everything the sandbox cannot be trusted to report honestly is enforced and obse
 
 ## Open questions
 
-- Default network policy: deny-all, or allow PyPI so `pip install` works out of the box?
-- Pool sizing: a fixed size, or grow to a ceiling under load?
-- Does file transfer ship in v0.1, or move to v0.2?
-- Where the DNS resolver runs now that each VM has its own network namespace: one per namespace, or one shared resolver reached through forwarding?
+- CPU and memory limits per sandbox: defaults to be chosen once the pool runs.
+- Whether the jailer's `--netns` option works as needed with snapshot restore. Untested.
+- Growing the pool under load, and a privileged helper so the library need not run as root: both after v0.1.

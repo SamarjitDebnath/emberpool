@@ -49,3 +49,51 @@ Design decisions, newest last. Related: [scope](00-scope.md) · [API](20-api.md)
 **Decision:** Each restored VM gets its own network namespace holding a tap named `tap0` with a fixed MAC, identical addressing inside, and a unique veth uplink with masquerade.
 **Why:** Clones share the snapshot's guest IP and MAC, so they only stay unambiguous on separate network stacks. The guest caches the template tap's MAC in ARP, so a tap with a new MAC breaks connectivity until a flush. Verified in the dev VM on Firecracker v1.18.0.
 **Rejected:** `network_overrides` with a unique tap and subnet per VM, re-addressing the guest over vsock: connectivity would depend on guest code.
+
+## v0.1 runs as root
+**Date:** 2026-11-27
+**Decision:** emberpool v0.1 must run as root on the host.
+**Why:** The jailer needs root for chroot, uid/gid drop and cgroups, and per-VM namespaces, taps and nftables rules need `CAP_NET_ADMIN`. Each Firecracker process still drops privileges under the jailer.
+**Rejected:** A privileged helper with an unprivileged library: safer, but too much to build for v0.1. Revisit later.
+
+## Shared read-only rootfs plus a per-VM scratch drive
+**Date:** 2026-11-27
+**Decision:** All clones share one read-only root filesystem. Each VM gets a small sparse scratch drive as the guest's overlayfs upper layer, at the same path inside its jailer chroot.
+**Why:** No per-VM rootfs copy, and the host can diff the scratch drive after teardown for the advisory file-change list.
+**Rejected:** Full rootfs copy per VM: 512 MB each. tmpfs upper layer: the host cannot see file changes.
+
+## One host resolver, policy in the root namespace
+**Date:** 2026-11-27
+**Decision:** One shared DNS resolver runs on the host. Each VM namespace only forwards DNS to it and masquerades traffic. Allow/drop rules and logging live in one root-namespace nftables table, keyed on each VM's veth, with one allow set per VM that the resolver fills.
+**Why:** One log stream for the trace and one table to manage. The veth subnet tells the resolver which VM asked.
+**Rejected:** A resolver and nftables table per namespace: N processes and N log streams.
+
+## Versioned trace schema
+**Date:** 2026-11-27
+**Decision:** `trace.json` carries `schema_version` and an ordered list of `dns` events (name, answer or `NXDOMAIN`, time) and `conn` events (destination IP, port, protocol, resolved name if known, allowed or dropped, time).
+**Why:** The trace is part of the public contract, so it needs a fixed, versioned shape before `TraceWriter` is written.
+**Rejected:** Raw nftables log lines: unstable and hard to consume.
+
+## Default network policy is deny
+**Date:** 2026-11-27
+**Decision:** A pool's default network policy is `"deny"`. PyPI and anything else must be allowlisted explicitly.
+**Why:** Safe by default, and every allowed destination shows up in the caller's code.
+**Rejected:** Allowing PyPI by default: convenient, but opens a path to an arbitrary-upload host without the caller asking.
+
+## Fixed pool size in v0.1
+**Date:** 2026-11-27
+**Decision:** A pool keeps a fixed number of idle VMs, set by `size`.
+**Why:** Predictable memory use and simpler code. Growing to a ceiling can be added later without changing the API.
+**Rejected:** Autoscaling under load in v0.1.
+
+## asyncio-only API
+**Date:** 2026-11-27
+**Decision:** The public API and the `Engine` protocol are async (asyncio). No blocking API in v0.1.
+**Why:** Agents call tools concurrently, and the pool restores replacements in the background. A blocking wrapper can be added later.
+**Rejected:** A sync API first, or both from the start.
+
+## File transfer deferred to v0.2
+**Date:** 2026-11-27
+**Decision:** v0.1 runs code only. The request frame reserves an optional `files` field so v0.2 can add file transfer without a protocol change.
+**Why:** Protects the v0.1 schedule while keeping the guest protocol stable.
+**Rejected:** File transfer in v0.1.

@@ -34,18 +34,19 @@ async with SandboxPool(size=4, network="allow:pypi.org,files.pythonhosted.org") 
 
 Creating a pool builds the template VM (boot once, snapshot), then restores `size` VMs and keeps them idle.
 
-- `size`: number of idle VMs kept ready. Whether the pool can grow under load is an open question.
+- `size`: number of idle VMs kept ready. Fixed for the pool's lifetime in v0.1.
 - `network`: egress policy for every sandbox in the pool.
   - `"deny"`: no network. The default.
   - `"allow:<name>,<name>,..."`: only these domain names resolve, and only connections to the addresses they resolved to are allowed.
 
-`await pool.run(code, files=None, timeout=...)` checks out an idle VM, starts a replacement restore in the background, runs `code` in the guest, destroys the VM and returns a `Result`.
+`await pool.run(code, timeout=...)` checks out an idle VM, starts a replacement restore in the background, runs `code` in the guest, destroys the VM and returns a `Result`.
 
 - `code`: Python source to run in the guest.
-- `files`: files to place in the guest before running. May move to v0.2.
 - `timeout`: wall-clock limit in seconds, enforced by the host killing the VM.
 
-The pool is an async context manager. Leaving it destroys every VM and network namespace it created.
+File transfer (a `files` argument) is planned for v0.2.
+
+The API is asyncio only; there is no blocking variant in v0.1. The pool is an async context manager. Leaving it destroys every VM and network namespace it created. The process must run as root.
 
 ## `Result`
 
@@ -61,7 +62,14 @@ Treat the host-recorded fields as evidence and the guest-reported fields as a co
 
 ## Trace
 
-The trace is also written as `trace.json`. Each entry is either a DNS query (name, answer or `NXDOMAIN`) or a connection attempt (destination, port, allowed or dropped). Connections are shown with the name that was resolved for them when there is one.
+The trace is also written as `trace.json`: a `schema_version` and an ordered list of events. There are two event types:
+
+| Type | Fields |
+|---|---|
+| `dns` | time, queried name, answer (addresses) or `NXDOMAIN` |
+| `conn` | time, destination IP, port, protocol, resolved name if known, `allowed` or `dropped` |
+
+The schema is versioned; fields are only added within a major version.
 
 ## Behaviour callers can rely on
 
@@ -84,4 +92,4 @@ send  [4-byte length][JSON request]   ──▶  run code in a subprocess
 recv  [4-byte length][JSON response]  ◀──  {stdout, stderr, exit_code}
 ```
 
-Frames are length-prefixed, not newline-delimited, because output routinely contains newlines. The agent's listening socket survives snapshot restore, so a restored VM is ready without relaunching it.
+Frames are length-prefixed, not newline-delimited, because output routinely contains newlines. The request reserves an optional `files` field for v0.2 file transfer; v0.1 agents ignore it. The agent's listening socket survives snapshot restore, so a restored VM is ready without relaunching it.

@@ -14,7 +14,8 @@ Related: [scope](00-scope.md) · [API](20-api.md) · [decisions](30-decisions.md
 | Guest kernel | 6.1 LTS, `CONFIG_VMGENID=y` | Must support VMGenID through device tree; see below |
 | Guest root filesystem | Alpine 3.20 + Python 3, ext4, 512 MB | |
 | Python (host) | 3.12+ | Managed with `uv` |
-| Host tools | `iproute2`, `nftables`, `curl`, `e2fsprogs` | Network setup needs `CAP_NET_ADMIN` |
+| Host tools | `iproute2`, `nftables`, `curl`, `e2fsprogs` | |
+| Privileges | root | v0.1 runs as root: the jailer and per-VM network setup need it |
 
 ### Developing on a Mac
 
@@ -113,8 +114,15 @@ Each sandbox gets its own network namespace containing:
 - a tap device named `tap0` with the fixed MAC `02:ee:00:00:00:01` and address `172.16.0.1/30` (the guest is `172.16.0.2`)
 - a veth pair to the host with a unique `/30` per sandbox (for example `10.200.N.0/30`)
 - IP forwarding on, and an nftables masquerade rule for traffic leaving through the veth
+- an nftables rule forwarding the guest's DNS to emberpool's shared resolver on the host
 
-The tap MAC must be the same for the template and every clone: the guest's ARP cache is part of the snapshot, and a tap with a different MAC gets no traffic until that cache is flushed. Creating namespaces, taps and nftables rules needs `CAP_NET_ADMIN`. See [decisions](30-decisions.md).
+The tap MAC must be the same for the template and every clone: the guest's ARP cache is part of the snapshot, and a tap with a different MAC gets no traffic until that cache is flushed.
+
+Allow/drop rules and logging are not in the namespace. They live in one emberpool nftables table in the host's root namespace, matched on each sandbox's veth, with one allow set per sandbox. See [decisions](30-decisions.md).
+
+## Disk layout per sandbox
+
+All sandboxes share one read-only `rootfs.ext4`. Each sandbox also gets a small sparse scratch drive that the guest uses as its overlayfs upper layer, so writes never touch the shared image. Both drives must appear at the same paths inside every sandbox's jailer chroot, because the snapshot records them. After teardown the host diffs the scratch drive to produce the advisory file-change list.
 
 ## Cleanup
 
