@@ -318,22 +318,22 @@ class Resolver:
         ):
             response.set_rcode(dns.rcode.REFUSED)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
 
         if name not in client.allow:
             response.set_rcode(dns.rcode.NXDOMAIN)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
 
         if question.rdtype != dns.rdatatype.A:
             # Allowed name, other type (AAAA, HTTPS...): no data. The guest is IPv4 only.
             self._event(client, name, ())
-            return response.to_wire()
+            return _wire(response)
 
         if client.inflight >= client.max_inflight:
             response.set_rcode(dns.rcode.SERVFAIL)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
         client.inflight += 1
         try:
             return await self._resolve_allowed(response, question.name, name, client)
@@ -350,12 +350,12 @@ class Resolver:
             log.info("upstream lookup of %s for %s failed: %s", name, client.vm_id, e)
             response.set_rcode(dns.rcode.SERVFAIL)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
 
         if result.addresses is None:
             response.set_rcode(dns.rcode.NXDOMAIN)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
 
         ips: list[str] = []
         for ip in result.addresses:
@@ -379,7 +379,7 @@ class Resolver:
             log.warning("could not allow %s for %s: %s", name, client.vm_id, e)
             response.set_rcode(dns.rcode.SERVFAIL)
             self._event(client, name, None)
-            return response.to_wire()
+            return _wire(response)
 
         if ips:
             ttl = max(0, min(int(result.ttl), _MAX_TTL))
@@ -387,13 +387,17 @@ class Resolver:
                 dns.rrset.from_text_list(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, ips)
             )
         self._event(client, name, tuple(ips))
-        return response.to_wire()
+        return _wire(response)
 
     def _event(self, client: ResolverClient, name: str, answers: tuple[str, ...] | None) -> None:
         try:
             self._emit(DnsEvent(time.time(), client.vm_id, name, answers))
         except Exception:
             log.exception("could not record DNS event for %s", client.vm_id)
+
+
+def _wire(msg: dns.message.Message) -> bytes:
+    return bytes(msg.to_wire())
 
 
 def _pktinfo_ifindex(ancdata: list[tuple[int, int, bytes]]) -> int | None:
