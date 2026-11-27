@@ -44,6 +44,21 @@ Creating a pool builds the template VM (boot once, snapshot), then restores `siz
 - `code`: Python source to run in the guest.
 - `timeout`: wall-clock limit in seconds, enforced by the host killing the VM.
 
+**When the pool is empty**, `run` waits for a replacement VM. `timeout` is one deadline that covers both the wait and the run:
+
+- If no VM becomes idle before the deadline, `run` raises `TimeoutError` and no code ran. The message names the last restore error, if any.
+- If the deadline passes while code is running, the host kills the VM and the `Result` has the timeout flag set.
+
+A failed replacement restore is retried in the background with backoff; it never blocks other runs or restores. Callers waiting on an empty pool are served in arrival order.
+
+`size` is the number of idle VMs, at most 128. VMs checked out for a run are extra, so many concurrent runs can hold more than `size` VMs at once.
+
+**Startup fails closed.** Entering the pool raises if the template build, a network namespace, any of the first `size` restores, or the VMGenID check fails. The VMGenID check runs on a separate probe VM restored from the template, which is destroyed and never serves a run. Everything created up to that point is torn down before the error propagates.
+
+**Sandbox.** `pool.checkout(timeout)` is an async context manager that yields one `Sandbox` (waiting up to `timeout` seconds for an idle VM). `await sandbox.run(code, timeout)` runs code once and destroys the VM; a second call raises. Leaving the block destroys the VM if it was not used. `pool.run` is `checkout` plus `run` under one deadline.
+
+**Errors.** Argument errors raise `TypeError` or `ValueError` before a VM is taken. If the guest agent dies or sends a bad reply, `run` still returns a `Result` with the host trace, `exit_code` `-1`, empty stdout and an emberpool message in stderr. A timed-out run also has `exit_code` `-1`. If the host cannot produce a complete trace (the event stream failed, or the VM exceeded the per-run event cap), `run` raises instead of returning a partial trace. Calling `run` after the pool has closed raises `RuntimeError`.
+
 File transfer (a `files` argument) is planned for v0.2.
 
 The API is asyncio only; there is no blocking variant in v0.1. The pool is an async context manager. Leaving it destroys every VM and network namespace it created. The process must run as root.
