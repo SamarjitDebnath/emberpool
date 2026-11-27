@@ -14,6 +14,11 @@ Lifecycle:
     exit    stop replacements, destroy every VM the pool still holds, stop
             the dispatcher, remove the work directory if the pool made it.
 
+With a tracer (trace.TraceWriter, internal `_tracer`), each VM's network is
+registered with it before the VM is restored, and its trace is finished after
+the kill and before the network is torn down. The tracer then owns
+NetPolicy.events(); the pool's own dispatcher is not started.
+
 Every VM is destroyed through one memoised task, so a run finishing and the
 pool closing at the same time release it exactly once, and the release keeps
 going if the awaiting task is cancelled (docs/40-rules.md rule 12).
@@ -32,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self, TypeVar
+from typing import Any, Literal, Protocol, Self, TypeVar
 
 from emberpool._names import new_vm_id
 from emberpool._protocol import MAX_CODE_BYTES, MAX_TIMEOUT
@@ -82,6 +87,28 @@ _TRACE_SETTLE_YIELDS = 5
 _State = Literal["new", "starting", "open", "closed"]
 
 
+class _TraceReport(Protocol):
+    """What a tracer's finish() returns (trace.TraceReport)."""
+
+    @property
+    def trace(self) -> Trace: ...
+
+    @property
+    def complete(self) -> bool: ...
+
+
+class _Tracer(Protocol):
+    """Host-side trace collector (trace.TraceWriter). When the pool has one,
+    the tracer consumes NetPolicy.events() and adds connection verdicts from
+    the nftables log; the pool's own event dispatcher is not started."""
+
+    async def register(self, net: NetHandle) -> None: ...
+
+    async def finish(self, vm_id: str, path: Path | None = None) -> _TraceReport: ...
+
+    def forget(self, vm_id: str) -> None: ...
+
+
 async def _shielded(aw: Coroutine[Any, Any, T] | asyncio.Future[T]) -> T:
     """Await `aw` to completion even if the caller is cancelled meanwhile, then
     re-raise the cancellation."""
@@ -128,6 +155,8 @@ class _VM:
     overflowed: bool = False
     file_changes: tuple[str, ...] = ()
     destroy_task: asyncio.Task[None] | None = None
+    registered: bool = False
+    report: _TraceReport | None = None
 
 
 class Sandbox:
@@ -220,6 +249,7 @@ class SandboxPool:
         _netpolicy: NetPolicy | None = None,
         _exec: ExecClient | None = None,
         _workdir: Path | None = None,
+        _tracer: _Tracer | None = None,
     ) -> None:
         if isinstance(size, bool) or not isinstance(size, int):
             raise TypeError("size must be an int")
@@ -234,6 +264,7 @@ class SandboxPool:
         self._engine: Engine = _engine
         self._net: NetPolicy = _netpolicy
         self._exec: ExecClient = _exec
+        self._tracer: _Tracer | None = _tracer
         self._given_workdir = _workdir
         self._workdir: Path | None = None
         self._made_workdir = False
@@ -307,7 +338,8 @@ class SandboxPool:
     # ------------------------------------------------------------------
 
     async def _start(self) -> None:
-        self._dispatcher = asyncio.create_task(self._dispatch_events())
+        if self._tracer is None:
+            self._dispatcher = asyncio.create_task(self._dispatch_events())
         if self._given_workdir is not None:
             self._workdir = self._given_workdir
         else:
@@ -484,6 +516,11 @@ class SandboxPool:
             vm.net = net
             if net.vm_id != vm.vm_id or net.index != index:
                 raise IsolationError(f"net setup returned a handle for another VM: {net!r}")
+            if self._tracer is not None:
+                # Before the VM exists, so no packet of it goes unrecorded.
+                vm.registered = True
+                async with asyncio.timeout(_STEP_TIMEOUT):
+                    await self._tracer.register(net)
             async with asyncio.timeout(_STEP_TIMEOUT):
                 handle = await self._engine.restore(self._template, vm.vm_id, net.netns)
             vm.handle = handle
@@ -516,8 +553,17 @@ class SandboxPool:
                 ok, changes = await self._step("list_changes", vm, self._engine.list_changes(vm.handle))
                 if ok and isinstance(changes, tuple) and all(isinstance(c, str) for c in changes):
                     vm.file_changes = changes
+                if vm.registered and self._tracer is not None:
+                    # After kill, before net teardown: the VM can send nothing more.
+                    _, vm.report = await self._step("trace finish", vm, self._tracer.finish(vm.vm_id))
             cleaned, _ = await self._step("cleanup", vm, self._engine.cleanup(vm.handle))
             released = released and cleaned
+        if vm.registered and self._tracer is not None:
+            # No-op after finish; drops the VM's events on every other path.
+            try:
+                self._tracer.forget(vm.vm_id)
+            except Exception as exc:
+                log.error("vm %s: trace forget failed: %r", vm.vm_id, exc)
         if vm.net is not None:
             torn, _ = await self._step("net teardown", vm, self._net.teardown(vm.net))
             released = released and torn
@@ -565,6 +611,13 @@ class SandboxPool:
 
     def _trace_of(self, vm: _VM) -> Trace:
         """The VM's trace. Refuses to return one that is known incomplete."""
+        if self._tracer is not None:
+            report = vm.report
+            if report is None:
+                raise IsolationError(f"vm {vm.vm_id}: no trace was recorded")
+            if report.complete is not True or not isinstance(report.trace, Trace):
+                raise IsolationError(f"vm {vm.vm_id}: the network trace is incomplete")
+            return report.trace
         self._raise_if_broken()
         if vm.overflowed:
             raise IsolationError(
