@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from emberpool import SandboxPool
+from emberpool import SandboxPool, Settings
 from emberpool._firecracker import FirecrackerConfig
 from emberpool._jailer import CGROUP_ROOT, JailerConfig
 from emberpool._names import run_command
@@ -321,3 +321,74 @@ async def test_allow_stand_in_index(engine_config, test_prefix, tmp_path):
                 )
     assert await our_netns(test_prefix) == set()
     assert_allowed_fetch(r, 8080)
+
+
+# -- the public path: SandboxPool(size, network, settings) in the root namespace --------
+
+
+async def skip_unless_forward_open(prefix: str, table: str) -> None:
+    ruleset = json.loads(await sh("nft", "-j", "list", "ruleset"))
+    blockers = forward_blockers(ruleset, prefix, table)
+    if blockers:
+        pytest.skip("host forward path blocked: " + forward_block_message(blockers, prefix))
+
+
+async def our_tables(prefix: str) -> list[str]:
+    out = (await sh("nft", "-j", "list", "tables")).decode()
+    return [
+        t["table"]["name"] for t in json.loads(out)["nftables"]
+        if "table" in t and t["table"]["name"].startswith(prefix)
+    ]
+
+
+@pytest.fixture
+async def settings(engine_config: FirecrackerConfig, test_prefix: str) -> AsyncIterator[Settings]:
+    await skip_unless_forward_open(test_prefix, test_prefix)
+    jail = engine_config.jailer
+    yield Settings(
+        firecracker=jail.firecracker_bin,
+        jailer=jail.jailer_bin,
+        kernel=engine_config.kernel_path,
+        rootfs=engine_config.rootfs_path,
+        jail_base=jail.chroot_base,
+        jail_uid=jail.uid,
+        jail_gid=jail.gid,
+        prefix=test_prefix,
+    )
+    assert await our_netns(test_prefix) == set()
+    assert await our_tables(test_prefix) == []
+
+
+async def test_timeout_kills_vm(settings):
+    async with SandboxPool(1, "deny", settings) as pool:
+        async with pool.checkout(60) as sandbox:
+            vm_id = sandbox.vm_id
+            r = await sandbox.run("while True:\n    pass\n", 3)
+        assert r.timed_out and r.exit_code == -1 and r.stdout == ""
+        assert vm_id not in pool._engine.tracked()  # type: ignore[attr-defined]
+        assert _vmm_pids({vm_id}) == []
+        # The pool keeps working after a kill.
+        again = await pool.run("print('ok')", 60)
+        assert again.stdout == "ok\n" and not again.timed_out
+
+
+async def test_empty_pool_waits_then_runs(settings):
+    async with SandboxPool(2, "deny", settings) as pool:
+        async with pool.checkout(60) as a, pool.checkout(60) as b:
+            # Both warm VMs are taken; their replacements are still restoring.
+            assert len(pool._idle) == 0
+            r = await pool.run("print('waited')", 120)
+            assert r.exit_code == 0 and r.stdout == "waited\n"
+            ra, rb = await a.run("print('a')", 60), await b.run("print('b')", 60)
+        assert (ra.stdout, rb.stdout) == ("a\n", "b\n")
+
+
+async def test_concurrent_runs_on_pool_of_two(settings):
+    code = "import os\nprint(os.urandom(16).hex())\n"
+    async with SandboxPool(2, "deny", settings) as pool:
+        results = await asyncio.gather(*(pool.run(code, 180) for _ in range(6)))
+        engine = pool._engine
+    assert all(r.exit_code == 0 and not r.timed_out for r in results), [r.stderr for r in results]
+    outputs = [r.stdout for r in results]
+    assert len(set(outputs)) == len(outputs)  # fresh VM and fresh random state per run
+    assert engine.tracked() == []  # type: ignore[attr-defined]
