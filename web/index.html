@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emberpool: disposable microVMs for AI agent code</title>
+<meta name="description" content="A Python library that gives AI agents a disposable Firecracker microVM per run, from a warm pool, with a host-recorded network audit trail.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='18' r='10' fill='%23e8590c'/><circle cx='16' cy='18' r='4' fill='%23ffd8a8'/></svg>">
+<style>
+  :root {
+    --bg: #fcfbf9; --fg: #1d1b18; --muted: #6b655c; --line: #e7e2da;
+    --accent: #d9480f; --code-bg: #f3efe8; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141210; --fg: #ece7df; --muted: #a39b8f; --line: #2c2823;
+      --accent: #ff8a4c; --code-bg: #1e1b18; --card: #1a1815;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 24px 80px; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  header .name { font-size: 15px; font-weight: 600; letter-spacing: .02em; color: var(--muted); }
+  header .name span { color: var(--accent); }
+  h1 { font-size: clamp(30px, 5vw, 42px); line-height: 1.15; margin: 14px 0 16px; letter-spacing: -.02em; }
+  .lede { font-size: 19px; color: var(--muted); margin: 0 0 24px; }
+  .status {
+    display: inline-block; font-size: 14px; padding: 4px 10px; border: 1px solid var(--line);
+    border-radius: 999px; color: var(--muted); margin-bottom: 28px;
+  }
+  .actions a {
+    display: inline-block; margin: 0 10px 10px 0; padding: 9px 16px; border-radius: 8px;
+    text-decoration: none; font-weight: 600; font-size: 15px;
+  }
+  .primary { background: var(--accent); color: #fff; }
+  .secondary { border: 1px solid var(--line); color: var(--fg); }
+  h2 { font-size: 22px; margin: 56px 0 12px; letter-spacing: -.01em; }
+  pre, code { font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; margin: 16px 0;
+  }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  .c { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-top: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .card p { margin: 0; font-size: 15px; color: var(--muted); }
+  ol { padding-left: 22px; } li { margin: 6px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; margin-top: 12px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+  ul.plain { list-style: none; padding: 0; } ul.plain li { margin: 8px 0; }
+  footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 14px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="name"><span>●</span> emberpool</div>
+    <h1>A disposable microVM for every piece of code your agent runs.</h1>
+    <p class="lede">A Python library that hands out Firecracker microVMs from a warm pool, destroys each one after a single run, and records on the host what the code tried to do over the network.</p>
+    <div class="status">Pre-alpha · aarch64 Linux · not yet released</div>
+    <div class="actions">
+      <a class="primary" href="https://github.com/SamarjitDebnath/emberpool">View on GitHub</a>
+      <a class="secondary" href="https://github.com/SamarjitDebnath/emberpool/tree/main/docs">Read the docs</a>
+    </div>
+  </header>
+
+<pre><code><span class="c"># one fresh VM per run; deny-by-default networking</span>
+from emberpool import SandboxPool
+
+async with SandboxPool(size=4, network="allow:pypi.org") as pool:
+    result = await pool.run("print(1 + 1)", timeout=10)
+    print(result.exit_code, result.stdout)
+    for event in result.trace:   <span class="c"># seen by the host, not reported by the guest</span>
+        print(event)</code></pre>
+
+  <h2>Why</h2>
+  <div class="grid">
+    <div class="card"><h3>A real VM boundary</h3><p>Each run gets its own Firecracker microVM under KVM with its own kernel, launched through the jailer. Code never shares the host kernel.</p></div>
+    <div class="card"><h3>Fast from snapshots</h3><p>One template VM is booted with Python loaded and snapshotted. Sandboxes are restored from it and kept warm.</p></div>
+    <div class="card"><h3>Evidence, not self-reporting</h3><p>DNS and connection decisions are made and logged on the host. The sandbox can't hide a lookup or a connection.</p></div>
+  </div>
+
+  <h2>How it works</h2>
+  <ol>
+    <li><strong>Build once.</strong> Boot a template VM, wait for the in-guest agent, snapshot memory and state.</li>
+    <li><strong>Restore many.</strong> Each sandbox gets a fresh jail, a fresh scratch drive and its own network namespace.</li>
+    <li><strong>Run.</strong> Code goes in over vsock; a replacement VM is restored in the background.</li>
+    <li><strong>Tear down.</strong> The VM is destroyed and the host's trace comes back with the result.</li>
+  </ol>
+  <p>Networking is deny by default. Allowlist domain names and emberpool's own resolver answers only those, while nftables on the host admits connections only to the addresses it returned.</p>
+
+  <h2>What you can trust in a result</h2>
+  <table>
+    <tr><th>Field</th><th>Recorded by</th><th>Trust</th></tr>
+    <tr><td><code>trace</code></td><td>Host resolver and nftables</td><td>Complete; the guest can't alter it</td></tr>
+    <tr><td><code>timed_out</code></td><td>Host</td><td>The host killed the VM</td></tr>
+    <tr><td><code>file_changes</code></td><td>Host, reading the scratch drive</td><td>Advisory; end state only</td></tr>
+    <tr><td><code>stdout</code>, <code>exit_code</code></td><td>Guest agent</td><td>Convenience; code can forge them</td></tr>
+  </table>
+
+  <h2>Requirements</h2>
+  <ul class="plain">
+    <li>Linux with KVM, aarch64 (the only architecture verified so far)</li>
+    <li>Firecracker v1.18.0 and its jailer, a 6.1 guest kernel with VMGenID</li>
+    <li>Python 3.12+ and uv · runs as root in v0.1</li>
+  </ul>
+
+  <h2>Documentation</h2>
+  <ul class="plain">
+    <li><a href="https://github.com/SamarjitDebnath/emberpool/blob/main/docs/00-scope.md">Scope</a>: what it does and doesn't do, trust model, limitations</li>
+    <li><a href="https://github.com/SamarjitDebnath/emberpool/blob/main/docs/10-setup.md">Setup</a>: host, kernel, guest image, networking</li>
+    <li><a href="https://github.com/SamarjitDebnath/emberpool/blob/main/docs/20-api.md">API</a>: the public Python API and trace format</li>
+    <li><a href="https://github.com/SamarjitDebnath/emberpool/blob/main/docs/30-decisions.md">Decisions</a>: design choices and what was rejected</li>
+  </ul>
+
+  <footer>emberpool is open source under the <a href="https://github.com/SamarjitDebnath/emberpool/blob/main/LICENSE">MIT license</a>. Pre-alpha: APIs may change, and no performance numbers are published yet.</footer>
+</main>
+</body>
+</html>
